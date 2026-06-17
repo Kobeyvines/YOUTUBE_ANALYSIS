@@ -1,0 +1,149 @@
+-- ========================================================================================
+-- PIPELINE STEP 1: INITIAL DATA PURGE, DEDUPLICATION, AND FEATURE ENGINEERING
+-- ========================================================================================
+-- Objective: Compress the raw Kaggle global dataset (~1.1 Million records) down to 98,860 rows.
+--
+-- Why this is necessary:
+-- 1. Eliminates "Trending Lifespan" Duplicates: The raw dataset logs a row for every single day
+--    a video stays on the trending tab (e.g., a video trending for 14 days gets 14 rows).
+--    This step collapses those duplicates into a single peak-performance snapshot.
+-- 2. Eliminates International Cross-over Overlap: Instead of partitioning by country, we
+--    partition strictly by `video_id` to enforce a strict one-row-per-video global structure,
+--    ideal for downstream ML model training with no data leakage.
+-- 3. Purges Column-Shifted Text Corruption: Drops malformed records caused by unescaped characters
+--    in raw CSV text (e.g., channel handles like '@bettervoice' bleeding into date fields).
+-- 4. Engineers Analytical Features: Formulates time-to-trend velocities and safely handles
+--    engagement ratios using NULLIF to insulate against zero-division errors.
+-- ========================================================================================
+
+CREATE TABLE youtube_data_schema.cleaned_trending_videos AS
+WITH CompletelyCleanData AS (
+    SELECT
+        video_id,
+        video_published_at::timestamp without time zone AS video_published_at,
+        to_date(video_trending__date, 'YYYY.MM.DD') AS video_trending_date,
+        video_trending_country,
+        video_title,
+        video_description,
+        video_tags,
+        video_category_id,
+        video_duration,
+        video_dimension,
+        video_definition,
+        video_licensed_content,
+        video_view_count,
+        video_like_count,
+        video_comment_count,
+        channel_id,
+        channel_title,
+        channel_country,
+        channel_subscriber_count,
+        channel_video_count,
+        channel_view_count,
+        channel_published_at,
+        -- Feature Engineering: Calculate days taken to trend
+        (to_date(video_trending__date, 'YYYY.MM.DD') - (video_published_at::timestamp)::date) AS days_to_trend,
+        -- Feature Engineering: Engagement Ratios (Protected against divide-by-zero)
+        round(((100.0 * video_like_count::numeric) / NULLIF(video_view_count::numeric, 0)), 4) AS like_view_ratio,
+        round(((10000.0 * video_comment_count::numeric) / NULLIF(video_view_count::numeric, 0)), 4) AS comment_density,
+        round((video_view_count::numeric / NULLIF(channel_subscriber_count::numeric, 0)), 4) AS subscriber_breakthrough_ratio,
+        EXTRACT(hour FROM video_published_at::timestamp) AS upload_hour,
+        EXTRACT(dow FROM video_published_at::timestamp) AS upload_day
+    FROM youtube_data_schema.youtube_trending_videos_global
+    -- Drop corrupt rows where text-shifting happened in raw CSV fields before casting
+    WHERE video_published_at LIKE '20%'
+      AND video_published_at NOT LIKE '%@%'
+),
+RankedGlobalVideos AS (
+    SELECT
+        *,
+        -- Isolate individual unique video entities globally.
+        -- Tie-breaking condition: prioritize the snapshot where the video hit its peak views.
+        ROW_NUMBER() OVER(
+            PARTITION BY video_id
+            ORDER BY video_view_count DESC, video_trending_date DESC
+        ) AS RN
+    FROM CompletelyCleanData
+)
+SELECT
+    video_id,
+    video_published_at,
+    video_trending_date AS final_trending_date,
+    video_trending_country AS peak_trending_country,
+    video_title,
+    video_description,
+    video_tags,
+    video_category_id,
+    video_duration,
+    video_dimension,
+    video_definition,
+    video_licensed_content,
+    video_view_count AS peak_view_count,
+    video_like_count AS peak_like_count,
+    video_comment_count AS peak_comment_count,
+    channel_id,
+    channel_title,
+    channel_country,
+    channel_subscriber_count,
+    channel_video_count,
+    channel_view_count,
+    channel_published_at,
+    days_to_trend,
+    like_view_ratio,
+    comment_density,
+    subscriber_breakthrough_ratio,
+    upload_hour,
+    upload_day
+FROM RankedGlobalVideos
+WHERE RN = 1;
+
+
+-- ========================================================================================
+-- PIPELINE STEP 2: NULL HANDLING AND FINAL MODELING QUANTIFICATION (VIEW)
+-- ========================================================================================
+-- Objective: Handle remaining sparse metrics and missing blocks to generate an unbroken matrix.
+--
+-- Why this is necessary:
+-- 1. Structural Text Shifts: Any rows where columns shifted so heavily that text sat in numeric
+--    fields were parsed as NULL upon table creation. This step filters out those incomplete records.
+-- 2. Ratio Imputation: Safely converts the NULL values generated by the NULLIF divide-by-zero protection
+--    (e.g., when a video has 0 views or a channel has 0 subscribers) back into an absolute 0.0.
+-- Result: Yields an unbroken matrix grid when evaluated downstream using 'msno.matrix()'.
+-- ========================================================================================
+
+CREATE OR REPLACE VIEW youtube_data_schema.vw_final_modeling_ready AS
+SELECT
+    video_id,
+    video_published_at,
+    final_trending_date AS video_trending_date, -- Mapped correctly from step 1 schema
+    peak_trending_country AS video_trending_country,
+    video_title,
+    video_description,
+    video_tags,
+    video_category_id,
+    video_duration,
+    video_dimension,
+    video_definition,
+    video_licensed_content,
+    peak_view_count AS video_view_count,
+    peak_like_count AS video_like_count,
+    peak_comment_count AS video_comment_count,
+    channel_id,
+    channel_title,
+    channel_country,
+    channel_subscriber_count,
+    channel_video_count,
+    channel_view_count,
+    channel_published_at,
+    days_to_trend,
+    -- Smooth out the engineered metric ratio nulls on the fly
+    COALESCE(like_view_ratio, 0.0) AS like_view_ratio,
+    COALESCE(comment_density, 0.0) AS comment_density,
+    COALESCE(subscriber_breakthrough_ratio, 0.0) AS subscriber_breakthrough_ratio,
+    upload_hour,
+    upload_day
+FROM youtube_data_schema.cleaned_trending_videos
+-- Filter out rows with incomplete structural metrics due to remaining shifted artifacts
+WHERE peak_view_count IS NOT NULL
+  AND peak_like_count IS NOT NULL
+  AND peak_comment_count IS NOT NULL;
