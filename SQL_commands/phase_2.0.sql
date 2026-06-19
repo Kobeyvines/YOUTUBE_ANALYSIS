@@ -43,9 +43,11 @@ SELECT
     COALESCE(CAST((REGEXP_MATCH(video_duration::text, '(\d+)S'))[1] AS INTEGER), 0)
         AS video_duration_seconds,
 
-    video_published_at::timestamp AS video_published_at,
-    video_trending_date::date AS video_trending_date,
-    channel_published_at::timestamp AS channel_published_at,
+    -- FIXED: Wrapped in NULLIF to convert empty strings ("") into true database NULLs before casting
+    NULLIF(video_published_at::text, '')::timestamp AS video_published_at,
+    NULLIF(video_trending_date::text, '')::date AS video_trending_date,
+    NULLIF(channel_published_at::text, '')::timestamp AS channel_published_at,
+
     upload_hour::integer AS upload_hour,
     upload_day::integer AS upload_day,
     days_to_trend::integer AS days_to_trend,
